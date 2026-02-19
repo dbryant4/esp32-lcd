@@ -1,0 +1,15 @@
+# macOS
+.DS_Store
+
+# Arduino CLI build output
+build-arduino/
+build-arduino-i2c-scan/
+
+# Arduino IDE / editor temporary files
+*.swp
+*.swo
+*~
+
+# Log files
+*.log
+

@@ -1,0 +1,31 @@
+---
+description: PRD guardrails for Arduino JC4827W543 + BME280 project
+alwaysApply: true
+---
+
+# Project PRD Rule
+
+## Scope
+
+- This repo is Arduino-only. Keep work centered on:
+  - `arduino/JC4827W543_LVGLv9/JC4827W543_LVGLv9.ino`
+  - `arduino/I2C_Pin_Scanner_BME280/I2C_Pin_Scanner_BME280.ino`
+  - supporting files in `scripts/` and `README.md`
+- Do not reintroduce ESP-IDF/CMake project structure unless explicitly requested.
+
+## Hardware and Sensor Constraints
+
+- BME280 communication uses I2C on `GPIO17` (SDA) and `GPIO18` (SCL).
+- BME280 address is `0x77` unless user explicitly asks to support another address.
+- Preserve live UI behavior: readable values, visible scales, and working brightness control.
+
+## Implementation Expectations
+
+- Keep UI changes high-contrast on dark backgrounds.
+- Prefer concise, incremental edits; avoid broad refactors unless requested.
+- Validate by building/flashing with project scripts after meaningful firmware changes.
+
+## Documentation Rules
+
+- Keep `README.md` aligned with current scripts and repo structure.
+- Include a Table of Contents in markdown files created or substantially updated.
