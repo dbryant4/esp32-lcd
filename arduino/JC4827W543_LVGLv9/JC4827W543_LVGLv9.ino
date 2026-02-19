@@ -10,6 +10,8 @@
 #include <Preferences.h>
 #include <ctype.h>
 #include <esp_system.h>
+#include <pgmspace.h>
+#include <SPIFFS.h>
 #include <time.h>
 #include <math.h>
 
@@ -26,7 +28,7 @@
 #define BACKLIGHT_PWM_BITS 8
 #define BACKLIGHT_DEFAULT_PERCENT 85
 #define FW_VERSION_MAJOR 1
-#define FW_VERSION_MINOR 1
+#define FW_VERSION_MINOR 2
 #define FW_VERSION_PATCH 1
 #define WIFI_AP_SSID_PREFIX "ESP32LCD-"
 #define WIFI_CONNECT_TIMEOUT_MS 45000UL
@@ -41,6 +43,37 @@
 #define DEBUG_PORTAL 1
 #define DISABLE_NTP 0
 #define DISABLE_WIFI 0
+
+#define HISTORY_SLOTS 2016
+#define HISTORY_INTERVAL_SEC 300
+#define HISTORY_PREFS_NAMESPACE "history"
+#define HISTORY_PERSIST_INTERVAL_MS 1800000UL
+/* Pressure chart scale: normal atmospheric range so minor changes are visible */
+#define PRESS_CHART_MIN_HPA 980
+#define PRESS_CHART_MAX_HPA 1040
+
+struct HistorySlot
+{
+  uint32_t timestamp;
+  int16_t temp_c_x10;
+  uint8_t hum_pct;
+  uint16_t press_hpa;
+  uint8_t valid;
+} __attribute__((packed));
+
+static HistorySlot s_history[HISTORY_SLOTS];
+static uint16_t s_history_head = 0;
+static uint16_t s_history_count = 0;
+static uint32_t s_last_history_commit_epoch = 0;
+static uint32_t s_last_history_persist_ms = 0;
+static float s_agg_temp_sum = 0.0f;
+static float s_agg_hum_sum = 0.0f;
+static float s_agg_press_sum = 0.0f;
+static uint32_t s_agg_count = 0;
+static float s_last_temp_c = 0.0f;
+static float s_last_hum_pct = 0.0f;
+static float s_last_press_hpa = 0.0f;
+static bool s_last_reading_valid = false;
 
 static TAMC_GT911 touchController(TOUCH_SDA, TOUCH_SCL, TOUCH_INT, TOUCH_RST, TOUCH_WIDTH, TOUCH_HEIGHT);
 static Adafruit_BME280 bme;
@@ -77,6 +110,13 @@ static lv_obj_t *s_wifi_signal_bars[4] = {NULL, NULL, NULL, NULL};
 static lv_obj_t *s_wifi_signal_x_label = NULL;
 static lv_obj_t *s_wifi_signal_bars_cont = NULL;
 static lv_obj_t *s_wifi_signal_x_cont = NULL;
+static lv_obj_t *s_trend_chart = NULL;
+static lv_chart_series_t *s_trend_series_temp = NULL;
+static lv_chart_series_t *s_trend_series_hum = NULL;
+static lv_chart_series_t *s_trend_series_press = NULL;
+static uint32_t s_last_chart_update_ms = 0;
+#define CHART_UPDATE_INTERVAL_MS 60000UL
+#define TREND_POINTS 24
 static const char *TZ_OPTIONS[] = {
     "UTC",
     "Eastern (EST/EDT)",
@@ -416,92 +456,48 @@ static void start_sta_connect()
   push_event_log(msg);
 }
 
-#define PORTAL_HTML_BUF_SIZE 4200
 #define PORTAL_SCAN_JSON_SIZE 1200
-static char s_portal_html_buf[PORTAL_HTML_BUF_SIZE];
+#define API_JSON_BUF_SIZE 12000
+#define API_HISTORY_MAX_POINTS 149
 static char s_portal_scan_json[PORTAL_SCAN_JSON_SIZE];
+static bool s_spiffs_ok = false;
+static char s_api_json_buf[API_JSON_BUF_SIZE];
 
-static void build_settings_html()
+#define API_ESC_BUF_SIZE 128
+static char s_device_label_buf[API_ESC_BUF_SIZE];
+static char s_saved_ssid_buf[API_ESC_BUF_SIZE];
+
+static void json_escape(const char *src, char *dst, size_t dst_size)
 {
-  char tz_opts[256];
-  size_t tz_len = 0;
-  for (uint8_t i = 0; i < TZ_OPTIONS_COUNT && tz_len < sizeof(tz_opts) - 64; i++)
+  size_t j = 0;
+  for (; *src && j < dst_size - 2; src++)
   {
-    const char *sel = (i == s_timezone_index) ? " selected" : "";
-    tz_len += snprintf(tz_opts + tz_len, sizeof(tz_opts) - tz_len,
-                      "<option value='%u'%s>%s</option>", i, sel, TZ_OPTIONS[i]);
+    if (*src == '\\' || *src == '"')
+      j += (size_t)snprintf(dst + j, dst_size - j, "\\%c", *src);
+    else if ((unsigned char)*src < 32)
+      j += (size_t)snprintf(dst + j, dst_size - j, "\\u%04x", (unsigned char)*src);
+    else
+      dst[j++] = *src;
   }
-  const char *header_line;
-  char header_buf[128];
-  if (s_wifi_state == WIFI_STATE_STA_CONNECTED && WiFi.status() == WL_CONNECTED)
-  {
-    snprintf(header_buf, sizeof(header_buf), "Device: <b>%s</b>", WiFi.localIP().toString().c_str());
-    header_line = header_buf;
-  }
-  else
-  {
-    snprintf(header_buf, sizeof(header_buf), "AP: <b>%s</b>", s_wifi_ap_ssid.c_str());
-    header_line = header_buf;
-  }
-  const char *save_btn = (s_wifi_state == WIFI_STATE_AP_PORTAL)
-                            ? "Save and Connect"
-                            : "Save Settings";
-  int n = snprintf(
-      s_portal_html_buf,
-      sizeof(s_portal_html_buf),
-      "<!DOCTYPE html><html><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>ESP32 Settings</title></head>"
-      "<body style='font-family:sans-serif;background:#0b1220;color:#e6eaf2;padding:1rem'>"
-      "<h2>ESP32 Settings</h2><p>%s</p>"
-      "<p><button onclick='doScan()'>Scan Networks</button> <span id='scanStatus'></span></p>"
-      "<form id='wf' method='POST'>"
-      "<label>Wi-Fi Network</label><br>"
-      "<select name='ssid' id='ssid' style='width:100%%;max-width:360px'>"
-      "<option value=''>-- Select or type below --</option></select><br>"
-      "<label>Or type SSID</label><br><input name='ssidManual' id='ssidManual' value='%.32s' style='width:100%%;max-width:360px' placeholder='Network name'><br><br>"
-      "<label>Password</label><br><input name='password' id='pw' type='password' style='width:100%%;max-width:360px' placeholder='Leave blank to keep current'><br><br>"
-      "<label>Timezone</label><br>"
-      "<select name='tz' id='tz' style='width:100%%;max-width:360px'>%s</select><br><br>"
-      "<label>Brightness</label><br><input name='brightness' id='brightness' type='range' min='5' max='100' value='%d' style='width:100%%;max-width:360px'> <span id='brightVal'>%d</span>%%<br><br>"
-      "<button type='button' onclick='doTest()'>Test Connection</button> "
-      "<button type='submit' formaction='/save'>%s</button> "
-      "<button type='button' onclick='doSaveTz()'>Save timezone only</button> "
-      "<button type='button' onclick='doSaveBrightness()'>Save brightness only</button>"
-      "<p id='msg' style='margin-top:0.5rem'></p></form>"
-      "<script>"
-      "document.getElementById('brightness').oninput=function(){document.getElementById('brightVal').textContent=this.value;};"
-      "function getSsid(){var s=document.getElementById('ssid').value;if(s)return s;return document.getElementById('ssidManual').value.trim();}"
-      "function doScan(){var st=document.getElementById('scanStatus');st.textContent='Scanning...';"
-      "fetch('/scan').then(r=>r.json()).then(nets=>{"
-      "var sel=document.getElementById('ssid');sel.innerHTML=\"<option value=''>-- Select --</option>\";"
-      "nets.forEach(n=>{var o=document.createElement('option');o.value=n.ssid;o.text=n.ssid+' ('+n.rssi+' dBm)';sel.add(o);});"
-      "st.textContent='Found '+nets.length;"
-      "}).catch(()=>{st.textContent='Scan failed';});}"
-      "function doTest(){var ssid=getSsid(),pw=document.getElementById('pw').value;if(!ssid){document.getElementById('msg').textContent='Select or enter SSID';return;}"
-      "document.getElementById('msg').textContent='Testing...';"
-      "var fd=new FormData();fd.append('ssid',ssid);fd.append('password',pw);"
-      "fetch('/test',{method:'POST',body:fd}).then(r=>r.text()).then(t=>{"
-      "document.getElementById('msg').textContent=t;"
-      "}).catch(()=>{document.getElementById('msg').textContent='Test failed';});}"
-      "document.getElementById('ssid').onchange=function(){document.getElementById('ssidManual').value=this.value;};"
-      "document.getElementById('ssidManual').oninput=function(){document.getElementById('ssid').value='';};"
-      "function doSaveTz(){var fd=new FormData();fd.append('tz',document.getElementById('tz').value);"
-      "fetch('/save_tz',{method:'POST',body:fd}).then(r=>r.text()).then(t=>{document.getElementById('msg').textContent=t;});}"
-      "function doSaveBrightness(){var fd=new FormData();fd.append('brightness',document.getElementById('brightness').value);"
-      "fetch('/save_brightness',{method:'POST',body:fd}).then(r=>r.text()).then(t=>{document.getElementById('msg').textContent=t;});}"
-      "</script></body></html>",
-      header_line,
-      s_wifi_sta_ssid.c_str(),
-      tz_opts,
-      s_brightness_percent,
-      s_brightness_percent,
-      save_btn);
-  if (n < 0 || (size_t)n >= sizeof(s_portal_html_buf))
-  {
-#if DEBUG_PORTAL
-    Serial.printf("[portal] HTML trunc? n=%d\n", n);
-#endif
-    push_event_log("Portal: HTML buf err");
-  }
+  dst[j] = '\0';
+}
+
+static const char *device_label_json()
+{
+  char raw[80];
+  const char *prefix = (s_wifi_state == WIFI_STATE_STA_CONNECTED && WiFi.status() == WL_CONNECTED) ? "Device: " : "AP: ";
+  const char *val = (s_wifi_state == WIFI_STATE_STA_CONNECTED && WiFi.status() == WL_CONNECTED)
+                        ? WiFi.localIP().toString().c_str()
+                        : s_wifi_ap_ssid.c_str();
+  snprintf(raw, sizeof(raw), "%s%s", prefix, val);
+  json_escape(raw, s_device_label_buf, sizeof(s_device_label_buf));
+  return s_device_label_buf;
+}
+
+static const char *saved_ssid_json()
+{
+  json_escape(s_wifi_sta_ssid.c_str(), s_saved_ssid_buf, sizeof(s_saved_ssid_buf));
+  return s_saved_ssid_buf;
 }
 
 static void setup_portal_routes()
@@ -518,6 +514,15 @@ static void setup_portal_routes()
   Serial.println("[portal] registering routes");
 #endif
   push_event_log("Portal: registering routes");
+
+  if (!s_spiffs_ok)
+  {
+    s_spiffs_ok = SPIFFS.begin(true);
+    if (s_spiffs_ok)
+      push_event_log("Portal: SPIFFS OK");
+    else
+      push_event_log("Portal: SPIFFS fail");
+  }
 
   s_wifi_server.on("/ping", HTTP_GET, []()
                    {
@@ -588,6 +593,26 @@ static void setup_portal_routes()
                      s_wifi_server.send(200, "text/plain", ok ? "Connection OK" : "Connection failed");
                    });
 
+  s_wifi_server.on("/portal.js", HTTP_GET, []()
+                   {
+                     s_portal_request_count++;
+                     if (!s_spiffs_ok)
+                     {
+                       push_event_log("Portal: SPIFFS not ready");
+                       s_wifi_server.send(500, "text/plain", "SPIFFS not ready");
+                       return;
+                     }
+                     File f = SPIFFS.open("/portal.js", "r");
+                     if (!f)
+                     {
+                       push_event_log("Portal: portal.js not found");
+                       s_wifi_server.send(404, "text/plain", "Not found");
+                       return;
+                     }
+                     s_wifi_server.streamFile(f, "application/javascript");
+                     f.close();
+                   });
+
   s_wifi_server.on("/", HTTP_GET, []()
                    {
                      s_portal_request_count++;
@@ -595,8 +620,21 @@ static void setup_portal_routes()
                      Serial.printf("[portal] GET / #%lu heap=%lu\n", (unsigned long)s_portal_request_count, (unsigned long)ESP.getFreeHeap());
 #endif
                      push_event_log("Portal: GET /");
-                     build_settings_html();
-                     s_wifi_server.send(200, "text/html", s_portal_html_buf);
+                     if (!s_spiffs_ok)
+                     {
+                       push_event_log("Portal: SPIFFS not ready");
+                       s_wifi_server.send(500, "text/plain", "SPIFFS not ready. Run data upload.");
+                       return;
+                     }
+                     File f = SPIFFS.open("/index.html", "r");
+                     if (!f)
+                     {
+                       push_event_log("Portal: index.html not found");
+                       s_wifi_server.send(404, "text/plain", "Not found");
+                       return;
+                     }
+                     s_wifi_server.streamFile(f, "text/html");
+                     f.close();
 #if DEBUG_PORTAL
                      Serial.println("[portal] GET / sent");
 #endif
@@ -686,6 +724,126 @@ static void setup_portal_routes()
                        s_wifi_server.send(400, "text/plain", "Invalid brightness (5-100)");
                    });
 
+  s_wifi_server.on("/api/readings", HTTP_GET, []()
+                   {
+                     float tc = s_last_temp_c;
+                     float tf = (tc * 9.0f / 5.0f) + 32.0f;
+                     float hum = s_last_hum_pct;
+                     float ph = s_last_press_hpa;
+                     time_t now_t = time(nullptr);
+                     uint32_t ts = (now_t >= 86400 * 365) ? (uint32_t)now_t : 0;
+                     int n = snprintf(s_api_json_buf, sizeof(s_api_json_buf),
+                                      "{\"temp_c\":%.1f,\"temp_f\":%.1f,\"humidity_pct\":%.1f,\"pressure_hpa\":%.1f,\"timestamp\":%lu,\"valid\":%s}",
+                                      tc, tf, hum, ph, (unsigned long)ts, s_last_reading_valid ? "true" : "false");
+                     if (n > 0 && (size_t)n < sizeof(s_api_json_buf))
+                       s_wifi_server.send(200, "application/json", s_api_json_buf);
+                     else
+                     {
+                       push_event_log("Portal: api/readings buf err");
+                       s_wifi_server.send(500, "application/json", "{\"error\":\"buffer\"}");
+                     }
+                   });
+
+  s_wifi_server.on("/api/history", HTTP_GET, []()
+                   {
+                     size_t step = 1;
+                     size_t max_points = API_HISTORY_MAX_POINTS;
+                     if (s_wifi_server.hasArg("res"))
+                     {
+                       String r = s_wifi_server.arg("res");
+                       if (r == "hourly") { step = 12; max_points = 168; }
+                       else if (r == "30min") { step = 6; max_points = 336; }
+                       else if (r == "15min") { step = 3; max_points = 672; }
+                       else if (r == "5min") { step = 1; max_points = HISTORY_SLOTS; }
+                     }
+                     if (max_points > API_HISTORY_MAX_POINTS)
+                       max_points = API_HISTORY_MAX_POINTS;
+                     if (step == 1 && s_history_count > max_points)
+                       step = (s_history_count + max_points - 1) / max_points;
+                     size_t start_idx = 0;
+                     if (step > 1 && s_history_count > 24)
+                     {
+                       size_t tail = s_history_count - 1;
+                       size_t need_slots = (max_points - 1) * step + 1;
+                       if (tail + 1 >= need_slots)
+                         start_idx = tail - (need_slots - 1);
+                     }
+                     size_t len = 0;
+                     len += snprintf(s_api_json_buf + len, sizeof(s_api_json_buf) - len, "[");
+                     size_t written = 0;
+                     for (size_t i = start_idx; i < s_history_count && written < max_points; i += step)
+                     {
+                       uint16_t phys = history_slot_index((uint16_t)i);
+                       HistorySlot *s = &s_history[phys];
+                       float tc = (float)s->temp_c_x10 / 10.0f;
+                       if (len < sizeof(s_api_json_buf) - 80)
+                         len += snprintf(s_api_json_buf + len, sizeof(s_api_json_buf) - len,
+                                         "%s{\"timestamp\":%lu,\"temp_c\":%.1f,\"humidity_pct\":%u,\"pressure_hpa\":%u,\"valid\":%s}",
+                                         (written > 0) ? "," : "", (unsigned long)s->timestamp, tc, (unsigned)s->hum_pct, (unsigned)s->press_hpa, s->valid ? "true" : "false");
+                       written++;
+                     }
+                     len += snprintf(s_api_json_buf + len, sizeof(s_api_json_buf) - len, "]");
+                     if (len < sizeof(s_api_json_buf))
+                       s_wifi_server.send(200, "application/json", s_api_json_buf);
+                     else
+                     {
+                       push_event_log("Portal: api/history buf err");
+                       s_wifi_server.send(500, "application/json", "{\"error\":\"buffer\"}");
+                     }
+                   });
+
+  s_wifi_server.on("/api/status", HTTP_GET, []()
+                   {
+                     float tc = s_last_temp_c;
+                     float tf = (tc * 9.0f / 5.0f) + 32.0f;
+                     time_t now_t = time(nullptr);
+                     uint32_t ts = (now_t >= 86400 * 365) ? (uint32_t)now_t : 0;
+                     const char *wifi_ssid = (s_wifi_state == WIFI_STATE_STA_CONNECTED && WiFi.status() == WL_CONNECTED) ? WiFi.SSID().c_str() : "";
+                     int n = snprintf(s_api_json_buf, sizeof(s_api_json_buf),
+                                      "{\"brightness\":%d,\"timezone_index\":%u,\"wifi_ssid\":\"%s\",\"wifi_connected\":%s,"
+                                      "\"temp_c\":%.1f,\"temp_f\":%.1f,\"humidity_pct\":%.1f,\"pressure_hpa\":%.1f,\"timestamp\":%lu,\"valid\":%s,"
+                                      "\"device_label\":\"%s\",\"saved_ssid\":\"%s\",\"save_btn\":\"%s\"}",
+                                      s_brightness_percent, (unsigned)s_timezone_index, wifi_ssid,
+                                      (s_wifi_state == WIFI_STATE_STA_CONNECTED && WiFi.status() == WL_CONNECTED) ? "true" : "false",
+                                      tc, tf, s_last_hum_pct, s_last_press_hpa, (unsigned long)ts, s_last_reading_valid ? "true" : "false",
+                                      device_label_json(), saved_ssid_json(), (s_wifi_state == WIFI_STATE_AP_PORTAL) ? "Save and Connect" : "Save Settings");
+                     if (n > 0 && (size_t)n < sizeof(s_api_json_buf))
+                       s_wifi_server.send(200, "application/json", s_api_json_buf);
+                     else
+                     {
+                       push_event_log("Portal: api/status buf err");
+                       s_wifi_server.send(500, "application/json", "{\"error\":\"buffer\"}");
+                     }
+                   });
+
+  s_wifi_server.on("/history.csv", HTTP_GET, []()
+                   {
+                     s_wifi_server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+                     s_wifi_server.sendHeader("Content-Disposition", "attachment; filename=\"history.csv\"");
+                     s_wifi_server.send(200, "text/csv", "");
+                     char row[128];
+                     snprintf(row, sizeof(row), "timestamp_utc,datetime_local,temp_c,temp_f,humidity_pct,pressure_hpa\n");
+                     s_wifi_server.sendContent(row);
+                     for (size_t i = 0; i < s_history_count; i++)
+                     {
+                       uint16_t phys = history_slot_index((uint16_t)i);
+                       HistorySlot *s = &s_history[phys];
+                       if (!s->valid)
+                         continue;
+                       float tc = (float)s->temp_c_x10 / 10.0f;
+                       float tf = (tc * 9.0f / 5.0f) + 32.0f;
+                       struct tm tmbuf;
+                       struct tm *tm = gmtime_r((time_t *)&s->timestamp, &tmbuf);
+                       char dt[32] = "";
+                       if (tm)
+                         strftime(dt, sizeof(dt), "%Y-%m-%dT%H:%M:%SZ", tm);
+                       snprintf(row, sizeof(row), "%lu,%s,%.1f,%.1f,%u,%u\n",
+                                (unsigned long)s->timestamp, dt, tc, tf, (unsigned)s->hum_pct, (unsigned)s->press_hpa);
+                       s_wifi_server.sendContent(row);
+                     }
+                     s_wifi_server.sendContent("");
+                   });
+
   s_wifi_server.on("/generate_204", HTTP_GET, []()
                    {
                      s_wifi_server.send(204, "text/plain", "");
@@ -769,7 +927,6 @@ static void start_ap_portal()
   Serial.printf("[portal] AP up %s heap=%lu\n", s_wifi_ap_ip.c_str(), (unsigned long)ESP.getFreeHeap());
 #endif
   push_event_log("Portal: AP up");
-  build_settings_html();
   setup_portal_routes();
   s_wifi_dns.setErrorReplyCode(DNSReplyCode::NoError);
   s_wifi_dns.start(WIFI_DNS_PORT, "*", ap_ip);
@@ -1145,6 +1302,109 @@ static int clamp_i32(int value, int min_v, int max_v)
   return value;
 }
 
+#define METRIC_TEMP 0
+#define METRIC_HUM 1
+#define METRIC_PRESS 2
+
+static void close_metric_dialog_cb(lv_event_t *e)
+{
+  lv_obj_t *btn = lv_event_get_target_obj(e);
+  lv_obj_t *modal = lv_obj_get_parent(btn);
+  lv_obj_del(modal);
+  lv_obj_remove_flag(lv_layer_top(), LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_set_style_bg_opa(lv_layer_top(), LV_OPA_TRANSP, 0);
+}
+
+static void metric_detail_dialog_cb(lv_event_t *e)
+{
+  uintptr_t metric = (uintptr_t)lv_event_get_user_data(e);
+  lv_obj_t *layer = lv_display_get_layer_top(disp);
+  lv_obj_add_flag(layer, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_set_style_bg_color(layer, lv_color_hex(0x000000), 0);
+  lv_obj_set_style_bg_opa(layer, LV_OPA_50, 0);
+
+  lv_obj_t *modal = lv_obj_create(layer);
+  lv_obj_remove_style_all(modal);
+  lv_obj_set_style_bg_color(modal, lv_color_hex(0x141E32), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(modal, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_border_color(modal, lv_color_hex(0x2A3240), LV_PART_MAIN);
+  lv_obj_set_style_border_width(modal, 2, LV_PART_MAIN);
+  lv_obj_set_style_radius(modal, 12, LV_PART_MAIN);
+  lv_obj_set_style_pad_all(modal, 12, LV_PART_MAIN);
+  lv_obj_set_size(modal, screenWidth - 40, screenHeight - 60);
+  lv_obj_center(modal);
+
+  const char *title = (metric == METRIC_TEMP) ? "Temperature (24h)" : (metric == METRIC_HUM) ? "Humidity (24h)" : "Pressure (24h)";
+  lv_obj_t *title_lbl = lv_label_create(modal);
+  lv_label_set_text(title_lbl, title);
+  lv_obj_set_style_text_color(title_lbl, lv_color_hex(0xE6EAF2), LV_PART_MAIN);
+  lv_obj_set_style_text_font(title_lbl, &lv_font_montserrat_22, LV_PART_MAIN);
+  lv_obj_align(title_lbl, LV_ALIGN_TOP_MID, 0, 4);
+
+  lv_obj_t *chart = lv_chart_create(modal);
+  lv_obj_set_size(chart, screenWidth - 64, screenHeight - 140);
+  lv_obj_align(chart, LV_ALIGN_TOP_MID, 0, 36);
+  lv_obj_set_style_bg_color(chart, lv_color_hex(0x0b1220), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(chart, LV_OPA_COVER, LV_PART_MAIN);
+  lv_chart_set_type(chart, LV_CHART_TYPE_LINE);
+  lv_chart_set_point_count(chart, TREND_POINTS);
+  lv_chart_set_div_line_count(chart, 2, 0);
+
+  lv_chart_series_t *series = NULL;
+  if (metric == METRIC_TEMP)
+  {
+    series = lv_chart_add_series(chart, lv_palette_main(LV_PALETTE_RED), LV_CHART_AXIS_PRIMARY_Y);
+    lv_chart_set_axis_range(chart, LV_CHART_AXIS_PRIMARY_Y, -10, 50);
+  }
+  else if (metric == METRIC_HUM)
+  {
+    series = lv_chart_add_series(chart, lv_palette_main(LV_PALETTE_BLUE), LV_CHART_AXIS_PRIMARY_Y);
+    lv_chart_set_axis_range(chart, LV_CHART_AXIS_PRIMARY_Y, 0, 100);
+  }
+  else
+  {
+    series = lv_chart_add_series(chart, lv_palette_main(LV_PALETTE_GREEN), LV_CHART_AXIS_PRIMARY_Y);
+    lv_chart_set_axis_range(chart, LV_CHART_AXIS_PRIMARY_Y, PRESS_CHART_MIN_HPA, PRESS_CHART_MAX_HPA);
+  }
+
+  int hourly_step = 12;
+  if ((int)s_history_count < TREND_POINTS * hourly_step)
+    hourly_step = 1;
+  for (int i = 0; i < TREND_POINTS; i++)
+  {
+    int logical_idx = (int)s_history_count - 1 - (TREND_POINTS - 1 - i) * hourly_step;
+    int32_t val = LV_CHART_POINT_NONE;
+    if (logical_idx >= 0 && (size_t)logical_idx < s_history_count)
+    {
+      uint16_t phys = history_slot_index((uint16_t)logical_idx);
+      HistorySlot *s = &s_history[phys];
+      if (s->valid)
+      {
+        if (metric == METRIC_TEMP)
+          val = (int32_t)((float)s->temp_c_x10 / 10.0f + 0.5f);
+        else if (metric == METRIC_HUM)
+          val = (int32_t)s->hum_pct;
+        else
+          val = (s->press_hpa >= PRESS_CHART_MIN_HPA && s->press_hpa <= PRESS_CHART_MAX_HPA) ? (int32_t)s->press_hpa : LV_CHART_POINT_NONE;
+      }
+    }
+    lv_chart_set_series_value_by_id(chart, series, (uint32_t)i, val);
+  }
+  lv_chart_refresh(chart);
+
+  lv_obj_t *close_btn = lv_button_create(modal);
+  lv_obj_set_size(close_btn, 80, 32);
+  lv_obj_align(close_btn, LV_ALIGN_BOTTOM_MID, 0, -8);
+  lv_obj_set_style_bg_color(close_btn, lv_color_hex(0x3b82f6), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(close_btn, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_radius(close_btn, 6, LV_PART_MAIN);
+  lv_obj_add_event_cb(close_btn, close_metric_dialog_cb, LV_EVENT_CLICKED, NULL);
+  lv_obj_t *close_lbl = lv_label_create(close_btn);
+  lv_label_set_text(close_lbl, "Close");
+  lv_obj_set_style_text_color(close_lbl, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
+  lv_obj_center(close_lbl);
+}
+
 static float c_to_f(float c)
 {
   return (c * 9.0f / 5.0f) + 32.0f;
@@ -1153,6 +1413,163 @@ static float c_to_f(float c)
 static float hpa_to_inhg(float hpa)
 {
   return hpa * 0.0295299831f;
+}
+
+static void history_push_slot(uint32_t ts, float temp_c, float hum_pct, float press_hpa, bool valid)
+{
+  HistorySlot *slot = &s_history[s_history_head];
+  slot->timestamp = ts;
+  slot->temp_c_x10 = (int16_t)(temp_c * 10.0f);
+  slot->hum_pct = (uint8_t)(hum_pct + 0.5f);
+  slot->press_hpa = (uint16_t)(press_hpa + 0.5f);
+  slot->valid = valid ? 1 : 0;
+  s_history_head = (s_history_head + 1) % HISTORY_SLOTS;
+  if (s_history_count < HISTORY_SLOTS)
+    s_history_count++;
+  s_last_history_commit_epoch = ts;
+}
+
+static uint16_t history_slot_index(uint16_t logical_idx)
+{
+  if (s_history_count < HISTORY_SLOTS)
+    return logical_idx;
+  return (s_history_head + logical_idx) % HISTORY_SLOTS;
+}
+
+static void history_maybe_persist()
+{
+  uint32_t now = millis();
+  if (s_history_count > 0 && (uint32_t)(now - s_last_history_persist_ms) >= HISTORY_PERSIST_INTERVAL_MS)
+    history_persist();
+}
+
+static void update_trend_chart()
+{
+  if (!s_trend_chart || !s_trend_series_temp || !s_trend_series_hum || !s_trend_series_press)
+    return;
+  int hourly_step = 12;
+  int max_hourly = TREND_POINTS;
+  if ((int)s_history_count < max_hourly * hourly_step)
+    hourly_step = 1;
+  for (int i = 0; i < TREND_POINTS; i++)
+  {
+    int logical_idx = (int)s_history_count - 1 - (TREND_POINTS - 1 - i) * hourly_step;
+    int32_t temp_val = LV_CHART_POINT_NONE;
+    int32_t hum_val = LV_CHART_POINT_NONE;
+    int32_t press_val = LV_CHART_POINT_NONE;
+    if (logical_idx >= 0 && (size_t)logical_idx < s_history_count)
+    {
+      uint16_t phys = history_slot_index((uint16_t)logical_idx);
+      HistorySlot *s = &s_history[phys];
+      if (s->valid)
+      {
+        temp_val = (int32_t)((float)s->temp_c_x10 / 10.0f + 0.5f);
+        hum_val = (int32_t)s->hum_pct;
+        if (s->press_hpa >= PRESS_CHART_MIN_HPA && s->press_hpa <= PRESS_CHART_MAX_HPA)
+          press_val = (int32_t)((s->press_hpa - PRESS_CHART_MIN_HPA) * 100 / (PRESS_CHART_MAX_HPA - PRESS_CHART_MIN_HPA));
+        else if (s->press_hpa < PRESS_CHART_MIN_HPA)
+          press_val = 0;
+        else
+          press_val = 100;
+      }
+    }
+    lv_chart_set_series_value_by_id(s_trend_chart, s_trend_series_temp, (uint32_t)i, temp_val);
+    lv_chart_set_series_value_by_id(s_trend_chart, s_trend_series_hum, (uint32_t)i, hum_val);
+    lv_chart_set_series_value_by_id(s_trend_chart, s_trend_series_press, (uint32_t)i, press_val);
+  }
+  lv_chart_refresh(s_trend_chart);
+}
+
+static void history_insert_gaps(uint32_t from_epoch, uint32_t to_epoch)
+{
+  uint32_t t = from_epoch;
+  while (t + HISTORY_INTERVAL_SEC <= to_epoch)
+  {
+    t += HISTORY_INTERVAL_SEC;
+    history_push_slot(t, 0.0f, 0.0f, 0.0f, false);
+  }
+}
+
+static void history_commit(float temp_c, float hum_pct, float press_hpa)
+{
+  time_t now = time(nullptr);
+  if (now < 86400 * 365)
+    return;
+  uint32_t epoch = (uint32_t)now;
+  uint32_t slot_epoch = (epoch / HISTORY_INTERVAL_SEC) * HISTORY_INTERVAL_SEC;
+  if (s_last_history_commit_epoch > 0 && slot_epoch > s_last_history_commit_epoch + HISTORY_INTERVAL_SEC)
+  {
+    uint32_t gap_count = (slot_epoch - s_last_history_commit_epoch) / HISTORY_INTERVAL_SEC - 1;
+    if (gap_count > 0 && gap_count <= HISTORY_SLOTS)
+      history_insert_gaps(s_last_history_commit_epoch, slot_epoch);
+  }
+  history_push_slot(slot_epoch, temp_c, hum_pct, press_hpa, true);
+  history_persist();
+}
+
+static void history_persist()
+{
+  Preferences p;
+  if (!p.begin(HISTORY_PREFS_NAMESPACE, false))
+    return;
+  p.putUShort("head", s_history_head);
+  p.putUShort("count", s_history_count);
+  p.putULong("last_epoch", (unsigned long)s_last_history_commit_epoch);
+  const size_t chunk_size = 500;
+  const size_t slot_size = sizeof(HistorySlot);
+  size_t total_bytes = s_history_count * slot_size;
+  for (size_t offset = 0; offset < total_bytes; offset += chunk_size)
+  {
+    char key[16];
+    snprintf(key, sizeof(key), "d%zu", offset / chunk_size);
+    size_t len = (offset + chunk_size <= total_bytes) ? chunk_size : (total_bytes - offset);
+    uint8_t buf[chunk_size];
+    for (size_t i = 0; i < len; i++)
+    {
+      size_t slot_idx = (offset + i) / slot_size;
+      size_t byte_in_slot = (offset + i) % slot_size;
+      uint16_t phys = history_slot_index((uint16_t)slot_idx);
+      buf[i] = ((uint8_t *)&s_history[phys])[byte_in_slot];
+    }
+    p.putBytes(key, buf, len);
+  }
+  p.end();
+  s_last_history_persist_ms = millis();
+}
+
+static void history_restore()
+{
+  Preferences p;
+  if (!p.begin(HISTORY_PREFS_NAMESPACE, true))
+    return;
+  s_history_head = p.getUShort("head", 0);
+  s_history_count = p.getUShort("count", 0);
+  s_last_history_commit_epoch = p.getULong("last_epoch", 0);
+  if (s_history_count == 0 || s_history_count > HISTORY_SLOTS)
+  {
+    p.end();
+    return;
+  }
+  const size_t chunk_size = 500;
+  const size_t slot_size = sizeof(HistorySlot);
+  size_t total_bytes = s_history_count * slot_size;
+  for (size_t offset = 0; offset < total_bytes; offset += chunk_size)
+  {
+    char key[16];
+    snprintf(key, sizeof(key), "d%zu", offset / chunk_size);
+    size_t len = (offset + chunk_size <= total_bytes) ? chunk_size : (total_bytes - offset);
+    uint8_t buf[chunk_size];
+    if (p.getBytes(key, buf, len) != len)
+      break;
+    for (size_t i = 0; i < len; i++)
+    {
+      size_t slot_idx = (offset + i) / slot_size;
+      size_t byte_in_slot = (offset + i) % slot_size;
+      uint16_t phys = history_slot_index((uint16_t)slot_idx);
+      ((uint8_t *)&s_history[phys])[byte_in_slot] = buf[i];
+    }
+  }
+  p.end();
 }
 
 static const char *trim_leading_spaces(char *s)
@@ -1195,6 +1612,7 @@ static void sensor_timer_cb(lv_timer_t *timer)
   LV_UNUSED(timer);
   if (!bme_ready)
   {
+    s_last_reading_valid = false;
     push_event_log_throttled("BME: sensor not ready", 5000, &s_last_bme_not_ready_log_ms);
     if (s_status_label)
     {
@@ -1212,6 +1630,7 @@ static void sensor_timer_cb(lv_timer_t *timer)
   float press_hpa = bme.readPressure() / 100.0f;
   if (isnan(temp_c) || isnan(hum_pct) || isnan(press_hpa))
   {
+    s_last_reading_valid = false;
     push_event_log_throttled("BME: invalid reading", 5000, &s_last_bme_invalid_log_ms);
     return;
   }
@@ -1219,6 +1638,32 @@ static void sensor_timer_cb(lv_timer_t *timer)
   {
     push_event_log("BME: first reading OK");
     s_logged_first_sensor_ok = true;
+  }
+  s_last_temp_c = temp_c;
+  s_last_hum_pct = hum_pct;
+  s_last_press_hpa = press_hpa;
+  s_last_reading_valid = true;
+  s_agg_temp_sum += temp_c;
+  s_agg_hum_sum += hum_pct;
+  s_agg_press_sum += press_hpa;
+  s_agg_count++;
+  time_t now_t = time(nullptr);
+  if (now_t >= 86400 * 365)
+  {
+    uint32_t epoch = (uint32_t)now_t;
+    uint32_t slot_epoch = (epoch / HISTORY_INTERVAL_SEC) * HISTORY_INTERVAL_SEC;
+    if (slot_epoch > s_last_history_commit_epoch)
+    {
+      float avg_t = (s_agg_count > 0) ? (s_agg_temp_sum / (float)s_agg_count) : temp_c;
+      float avg_h = (s_agg_count > 0) ? (s_agg_hum_sum / (float)s_agg_count) : hum_pct;
+      float avg_p = (s_agg_count > 0) ? (s_agg_press_sum / (float)s_agg_count) : press_hpa;
+      history_commit(avg_t, avg_h, avg_p);
+      s_agg_temp_sum = 0.0f;
+      s_agg_hum_sum = 0.0f;
+      s_agg_press_sum = 0.0f;
+      s_agg_count = 0;
+      history_maybe_persist();
+    }
   }
   update_sensor_ui(temp_c, hum_pct, press_hpa);
   if (s_status_label)
@@ -1251,6 +1696,7 @@ void setup()
 #endif
   uiPrefs.begin(UI_PREFS_NAMESPACE, false);
   load_timezone();
+  history_restore();
 
   if (!gfx->begin())
   {
@@ -1391,17 +1837,23 @@ void setup()
   lv_obj_set_width(s_temp_label, col_w - 8);
   lv_obj_set_style_text_color(s_temp_label, lv_color_hex(0x8BA3C7), LV_PART_MAIN);
   lv_obj_set_style_text_font(s_temp_label, &lv_font_montserrat_14, LV_PART_MAIN);
+  lv_obj_add_flag(s_temp_label, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(s_temp_label, metric_detail_dialog_cb, LV_EVENT_CLICKED, (void *)(uintptr_t)METRIC_TEMP);
   s_temp_value_label = lv_label_create(scr);
   lv_obj_set_pos(s_temp_value_label, pad, content_top + 28);
   lv_obj_set_width(s_temp_value_label, col_w - 8);
   lv_label_set_long_mode(s_temp_value_label, LV_LABEL_LONG_CLIP);
   lv_obj_set_style_text_color(s_temp_value_label, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
   lv_obj_set_style_text_font(s_temp_value_label, &lv_font_montserrat_36, LV_PART_MAIN);
+  lv_obj_add_flag(s_temp_value_label, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(s_temp_value_label, metric_detail_dialog_cb, LV_EVENT_CLICKED, (void *)(uintptr_t)METRIC_TEMP);
   s_temp_bar = lv_bar_create(scr);
   lv_obj_set_pos(s_temp_bar, pad, content_top + 68);
   lv_obj_set_size(s_temp_bar, col_w - 8, 8);
   lv_bar_set_range(s_temp_bar, -10, 50);
   style_metric_bar(s_temp_bar, LV_PALETTE_RED);
+  lv_obj_add_flag(s_temp_bar, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(s_temp_bar, metric_detail_dialog_cb, LV_EVENT_CLICKED, (void *)(uintptr_t)METRIC_TEMP);
   s_temp_c_value_label = lv_label_create(scr);
   lv_obj_set_pos(s_temp_c_value_label, pad, content_top + 80);
   lv_obj_set_width(s_temp_c_value_label, col_w - 8);
@@ -1414,34 +1866,74 @@ void setup()
   lv_obj_set_width(s_hum_label, col_w - 8);
   lv_obj_set_style_text_color(s_hum_label, lv_color_hex(0x8BA3C7), LV_PART_MAIN);
   lv_obj_set_style_text_font(s_hum_label, &lv_font_montserrat_14, LV_PART_MAIN);
+  lv_obj_add_flag(s_hum_label, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(s_hum_label, metric_detail_dialog_cb, LV_EVENT_CLICKED, (void *)(uintptr_t)METRIC_HUM);
   s_hum_value_label = lv_label_create(scr);
   lv_obj_set_pos(s_hum_value_label, pad + col_w + col_gap, content_top + 28);
   lv_obj_set_width(s_hum_value_label, col_w - 8);
   lv_label_set_long_mode(s_hum_value_label, LV_LABEL_LONG_CLIP);
   lv_obj_set_style_text_color(s_hum_value_label, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
   lv_obj_set_style_text_font(s_hum_value_label, &lv_font_montserrat_36, LV_PART_MAIN);
+  lv_obj_add_flag(s_hum_value_label, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(s_hum_value_label, metric_detail_dialog_cb, LV_EVENT_CLICKED, (void *)(uintptr_t)METRIC_HUM);
   s_hum_bar = lv_bar_create(scr);
   lv_obj_set_pos(s_hum_bar, pad + col_w + col_gap, content_top + 68);
   lv_obj_set_size(s_hum_bar, col_w - 8, 8);
   lv_bar_set_range(s_hum_bar, 0, 100);
   style_metric_bar(s_hum_bar, LV_PALETTE_BLUE);
+  lv_obj_add_flag(s_hum_bar, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(s_hum_bar, metric_detail_dialog_cb, LV_EVENT_CLICKED, (void *)(uintptr_t)METRIC_HUM);
 
   s_press_label = lv_label_create(scr);
   lv_obj_set_pos(s_press_label, pad + 2 * (col_w + col_gap), content_top + 8);
   lv_obj_set_width(s_press_label, col_w - 8);
   lv_obj_set_style_text_color(s_press_label, lv_color_hex(0x8BA3C7), LV_PART_MAIN);
   lv_obj_set_style_text_font(s_press_label, &lv_font_montserrat_14, LV_PART_MAIN);
+  lv_obj_add_flag(s_press_label, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(s_press_label, metric_detail_dialog_cb, LV_EVENT_CLICKED, (void *)(uintptr_t)METRIC_PRESS);
   s_press_value_label = lv_label_create(scr);
   lv_obj_set_pos(s_press_value_label, pad + 2 * (col_w + col_gap), content_top + 28);
   lv_obj_set_width(s_press_value_label, col_w - 8);
   lv_label_set_long_mode(s_press_value_label, LV_LABEL_LONG_CLIP);
   lv_obj_set_style_text_color(s_press_value_label, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
   lv_obj_set_style_text_font(s_press_value_label, &lv_font_montserrat_36, LV_PART_MAIN);
+  lv_obj_add_flag(s_press_value_label, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(s_press_value_label, metric_detail_dialog_cb, LV_EVENT_CLICKED, (void *)(uintptr_t)METRIC_PRESS);
   s_press_bar = lv_bar_create(scr);
   lv_obj_set_pos(s_press_bar, pad + 2 * (col_w + col_gap), content_top + 68);
   lv_obj_set_size(s_press_bar, col_w - 8, 8);
   lv_bar_set_range(s_press_bar, 900, 1100);
   style_metric_bar(s_press_bar, LV_PALETTE_GREEN);
+  lv_obj_add_flag(s_press_bar, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(s_press_bar, metric_detail_dialog_cb, LV_EVENT_CLICKED, (void *)(uintptr_t)METRIC_PRESS);
+
+  const int chart_top = 156;
+  const int chart_h = 98;
+  s_trend_chart = lv_chart_create(scr);
+  lv_obj_set_pos(s_trend_chart, pad, chart_top);
+  lv_obj_set_size(s_trend_chart, screenWidth - 2 * pad, chart_h);
+  lv_obj_set_style_bg_color(s_trend_chart, lv_color_hex(0x141E32), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(s_trend_chart, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_border_color(s_trend_chart, lv_color_hex(0x2A3240), LV_PART_MAIN);
+  lv_obj_set_style_border_width(s_trend_chart, 1, LV_PART_MAIN);
+  lv_obj_set_style_radius(s_trend_chart, 6, LV_PART_MAIN);
+  lv_obj_set_style_pad_all(s_trend_chart, 4, LV_PART_MAIN);
+  lv_chart_set_type(s_trend_chart, LV_CHART_TYPE_LINE);
+  lv_chart_set_point_count(s_trend_chart, TREND_POINTS);
+  lv_chart_set_div_line_count(s_trend_chart, 2, 0);
+  lv_chart_set_axis_range(s_trend_chart, LV_CHART_AXIS_PRIMARY_Y, -10, 50);
+  lv_chart_set_axis_range(s_trend_chart, LV_CHART_AXIS_SECONDARY_Y, 0, 100);
+  s_trend_series_temp = lv_chart_add_series(s_trend_chart, lv_palette_main(LV_PALETTE_RED), LV_CHART_AXIS_PRIMARY_Y);
+  s_trend_series_hum = lv_chart_add_series(s_trend_chart, lv_palette_main(LV_PALETTE_BLUE), LV_CHART_AXIS_SECONDARY_Y);
+  s_trend_series_press = lv_chart_add_series(s_trend_chart, lv_palette_main(LV_PALETTE_GREEN), LV_CHART_AXIS_SECONDARY_Y);
+  lv_obj_t *chart_timescale = lv_label_create(scr);
+  lv_label_set_text(chart_timescale, "last 24 hours");
+  lv_obj_set_style_text_color(chart_timescale, lv_color_hex(0x8BA3C7), LV_PART_MAIN);
+  lv_obj_set_style_text_font(chart_timescale, &lv_font_montserrat_14, LV_PART_MAIN);
+  lv_obj_set_width(chart_timescale, screenWidth - 2 * pad);
+  lv_obj_set_style_text_align(chart_timescale, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+  lv_obj_set_pos(chart_timescale, pad, chart_top + chart_h + 2);
+  update_trend_chart();
 
   update_sensor_ui(0.0f, 0.0f, 900.0f);
   sensor_timer_cb(NULL);
@@ -1600,6 +2092,15 @@ void loop()
   s_loop_count++;
   lv_timer_handler();
   wifi_runtime_tick();
+  history_maybe_persist();
+  {
+    uint32_t now_ms = millis();
+    if (s_trend_chart && (uint32_t)(now_ms - s_last_chart_update_ms) >= CHART_UPDATE_INTERVAL_MS)
+    {
+      s_last_chart_update_ms = now_ms;
+      update_trend_chart();
+    }
+  }
   gfx->flush();
   delay(5);
 }

@@ -4,7 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 SKETCH_PATH="$PROJECT_ROOT/arduino/JC4827W543_LVGLv9/JC4827W543_LVGLv9.ino"
-BUILD_DIR="$PROJECT_ROOT/build-arduino"
+BUILD_DIR="$(cd "$PROJECT_ROOT" && pwd)/build-arduino"
 FQBN="esp32:esp32:esp32s3:PartitionScheme=huge_app"
 PORT="/dev/cu.usbmodem101"
 
@@ -79,6 +79,7 @@ case "$ACTION" in
   upload)
     install_deps
     upload_firmware
+    "$SCRIPT_DIR/upload-portal-data.sh" --port "$PORT"
     ;;
   *)
     echo "Usage: $0 [deps|build|release|upload] [--port /dev/cu.usbmodemXXX]" >&2

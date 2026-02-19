@@ -9,15 +9,20 @@ This repo is intentionally cleaned down to the two active Arduino sketches:
 
 - [Structure](#structure)
 - [Firmware Dashboard Sketch](#firmware-dashboard-sketch)
+- [Flashing from Release](#flashing-from-release)
 - [Wi-Fi Provisioning (ESPHome-Style)](#wi-fi-provisioning-esphome-style)
+- [Web UI and API](#web-ui-and-api)
+- [Historical Data Storage](#historical-data-storage)
 - [Firmware Versioning](#firmware-versioning)
 - [I2C Scanner Sketch](#i2c-scanner-sketch)
 
 ## Structure
 
 - `arduino/JC4827W543_LVGLv9/` - main LVGL dashboard firmware
+- `arduino/JC4827W543_LVGLv9/data/` - portal HTML/JS (SPIFFS)
 - `arduino/I2C_Pin_Scanner_BME280/` - I2C/BME280 scanner firmware
 - `scripts/fw-arduino.sh` - build/upload script for dashboard sketch
+- `scripts/upload-portal-data.sh` - upload portal files to SPIFFS
 - `scripts/scan-i2c-pins.sh` - build/upload/monitor script for scanner sketch
 - `scripts/version.sh` - semantic version management helper
 
@@ -35,6 +40,24 @@ Uses ESP32S3 `huge_app` partition scheme via `scripts/fw-arduino.sh` so larger f
 # build + upload
 ./scripts/fw-arduino.sh upload --port /dev/cu.usbmodem101
 ```
+
+## Flashing from Release
+
+Pre-built firmware binaries are attached to [GitHub Releases](https://github.com/derrickbryant/esp32-lcd/releases). To flash without building from source:
+
+1. **Download the .bin file** from the latest release (e.g. `JC4827W543_LVGLv9-1.2.1.bin`).
+
+2. **Install esptool** (if needed):
+   ```bash
+   pip install esptool
+   ```
+
+3. **Flash the firmware** (replace `PORT` with your device, e.g. `/dev/cu.usbmodem101` on macOS):
+   ```bash
+   esptool.py --chip esp32s3 -p PORT write_flash 0x0 JC4827W543_LVGLv9-1.2.1.bin
+   ```
+
+4. **Reset the device** — it will boot into the new firmware.
 
 ## Wi-Fi Provisioning (ESPHome-Style)
 
@@ -59,13 +82,44 @@ Validation checklist:
 5. Reboot and verify the device reconnects without entering AP mode.
 6. Power off router/AP temporarily and confirm reconnect or fallback behavior without UI lockups.
 
+## Web UI and API
+
+The portal (HTML/JS) is served from SPIFFS. After flashing firmware, upload the portal data:
+
+```bash
+./scripts/upload-portal-data.sh --port /dev/cu.usbmodem101
+```
+
+When connected (STA or AP mode), the web UI at `http://<device-ip>/` has two pages:
+
+- **Status** (default): Live readings (refreshed every 5 seconds), 7-day history chart (temp, humidity, pressure), history table, and CSV download link
+- **Settings**: Wi-Fi provisioning, timezone, and brightness controls
+
+**API endpoints** (JSON):
+
+- `GET /api/readings` — Current sensor values (temp_c, temp_f, humidity_pct, pressure_hpa, timestamp, valid)
+- `GET /api/history` — 7-day history; `?res=5min` (2016 pts), `?res=15min` (672), `?res=30min` (336), `?res=hourly` (168)
+- `GET /api/status` — Settings plus current readings
+- `GET /history.csv` — Download full 7-day history as CSV
+
+History is stored at 5-minute resolution with NTP timestamps. Gaps (device off) are marked with `valid: false` in the API and omitted from the CSV.
+
+## Historical Data Storage
+
+Historical sensor data is stored entirely on the ESP32:
+
+- **RAM (ring buffer)**: 2016 slots in a circular buffer (~20 KB). Each slot holds: Unix timestamp, temperature (0.1°C), humidity (%), pressure (hPa), and a valid flag. Data is written every 5 minutes as an average of the 1-second BME280 readings.
+- **Flash (NVS)**: The ring buffer is persisted to non-volatile storage (Preferences namespace `history`) every 30 minutes. On boot, the buffer is restored so history survives power cycles.
+- **Gap handling**: When the device was off, missed 5-minute intervals are filled with gap entries (`valid: false`) so the timeline stays correct. Gaps are not written to the CSV download.
+- **Resolution**: 7 days at 5-minute intervals (12 samples/hour × 24 hours × 7 days = 2016 slots).
+
 ## Firmware Versioning
 
 - Semantic version source of truth is in `arduino/JC4827W543_LVGLv9/JC4827W543_LVGLv9.ino`:
   - `FW_VERSION_MAJOR`
   - `FW_VERSION_MINOR`
   - `FW_VERSION_PATCH`
-- Current version: `1.1.0`.
+- Current version: `1.2.0`.
 - The debug screen shows `Firmware: v<major.minor.patch>`.
 
 ```bash
