@@ -4,6 +4,10 @@
 # Arduino CLI build output
 build-arduino/
 build-arduino-i2c-scan/
+arduino/JC4827W543_LVGLv9/build/
+
+# Release binaries (attached to GH releases, not committed)
+*.bin
 
 # Arduino IDE / editor temporary files
 *.swp

@@ -53,6 +53,19 @@ upload_firmware() {
   arduino-cli upload -p "$PORT" --fqbn "$FQBN" --input-dir "$BUILD_DIR" "$SKETCH_PATH"
 }
 
+release_build() {
+  compile_only
+  local bin_src="$BUILD_DIR/JC4827W543_LVGLv9.ino.merged.bin"
+  local major minor patch version
+  major="$(sed -n 's/^#define FW_VERSION_MAJOR[[:space:]]*\([0-9]*\).*/\1/p' "$SKETCH_PATH" | head -1)"
+  minor="$(sed -n 's/^#define FW_VERSION_MINOR[[:space:]]*\([0-9]*\).*/\1/p' "$SKETCH_PATH" | head -1)"
+  patch="$(sed -n 's/^#define FW_VERSION_PATCH[[:space:]]*\([0-9]*\).*/\1/p' "$SKETCH_PATH" | head -1)"
+  version="${major:-0}.${minor:-0}.${patch:-0}"
+  local bin_dest="$PROJECT_ROOT/JC4827W543_LVGLv9-${version}.bin"
+  cp "$bin_src" "$bin_dest"
+  echo "Release binary: $bin_dest"
+}
+
 case "$ACTION" in
   deps)
     install_deps
@@ -60,12 +73,15 @@ case "$ACTION" in
   build)
     compile_only
     ;;
+  release)
+    release_build
+    ;;
   upload)
     install_deps
     upload_firmware
     ;;
   *)
-    echo "Usage: $0 [deps|build|upload] [--port /dev/cu.usbmodemXXX]" >&2
+    echo "Usage: $0 [deps|build|release|upload] [--port /dev/cu.usbmodemXXX]" >&2
     exit 1
     ;;
 esac
