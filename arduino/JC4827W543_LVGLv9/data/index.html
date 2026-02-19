@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ESP32 Dashboard</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body style="font-family:sans-serif;background:#0b1220;color:#e6eaf2;padding:1rem;margin:0">
+<nav style="display:flex;gap:1rem;margin-bottom:1rem;border-bottom:1px solid #2a3240;padding-bottom:0.5rem">
+<a href="#status" id="navStatus" style="color:#60a5fa;text-decoration:none">Status</a>
+<a href="#settings" id="navSettings" style="color:#8ba3c7;text-decoration:none">Settings</a>
+<span style="margin-left:auto;font-size:0.9rem" id="deviceLabel">Device: --</span>
+</nav>
+<div id="statusPage">
+<h2>Status</h2>
+<h3>Live Readings</h3>
+<p id="liveReadings">Loading...</p>
+<h3>7-Day History</h3>
+<p style="margin-bottom:0.5rem">Resolution: <select id="historyRes" style="padding:4px 8px;background:#1e293b;color:#e6eaf2;border:1px solid #2a3240;border-radius:4px">
+<option value="5min">Every 5 min (~2016 pts)</option>
+<option value="15min">Every 15 min (~672 pts)</option>
+<option value="30min">Every 30 min (~336 pts)</option>
+<option value="hourly" selected>Hourly (~168 pts)</option>
+</select></p>
+<div style="height:220px;margin:1rem 0"><canvas id="historyChart"></canvas></div>
+<p><a href="/history.csv" download="history.csv" style="color:#60a5fa">Download CSV</a></p>
+<div id="historyTable" style="max-height:200px;overflow-y:auto;font-size:0.9rem">
+<table style="border-collapse:collapse;width:100%"><thead><tr style="border-bottom:1px solid #2a3240">
+<th style="text-align:left;padding:4px">Time</th><th style="text-align:right;padding:4px">Temp C</th>
+<th style="text-align:right;padding:4px">Hum %</th><th style="text-align:right;padding:4px">hPa</th></tr></thead>
+<tbody id="historyBody"></tbody></table></div>
+</div>
+<div id="settingsPage" style="display:none">
+<h2>Settings</h2>
+<p id="settingsDeviceLabel">Device: --</p>
+<p><button onclick="doScan()">Scan Networks</button> <span id="scanStatus"></span></p>
+<form id="wf" method="POST">
+<label>Wi-Fi Network</label><br>
+<select name="ssid" id="ssid" style="width:100%;max-width:360px">
+<option value="">-- Select or type below --</option></select><br>
+<label>Or type SSID</label><br>
+<input name="ssidManual" id="ssidManual" value="" style="width:100%;max-width:360px" placeholder="Network name"><br><br>
+<label>Password</label><br>
+<input name="password" id="pw" type="password" style="width:100%;max-width:360px" placeholder="Leave blank to keep current"><br><br>
+<label>Timezone</label><br>
+<select name="tz" id="tz" style="width:100%;max-width:360px"></select><br><br>
+<label>Brightness</label><br>
+<input name="brightness" id="brightness" type="range" min="5" max="100" value="42" style="width:100%;max-width:360px"> <span id="brightVal">42</span>%<br><br>
+<button type="button" onclick="doTest()">Test Connection</button>
+<button type="submit" formaction="/save" id="saveBtn">Save Settings</button>
+<button type="button" onclick="doSaveTz()">Save timezone only</button>
+<button type="button" onclick="doSaveBrightness()">Save brightness only</button>
+<p id="msg" style="margin-top:0.5rem"></p>
+</form>
+</div>
+<script src="/portal.js"></script>
+</body>
+</html>

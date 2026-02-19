@@ -9,6 +9,7 @@ This repo is intentionally cleaned down to the two active Arduino sketches:
 
 - [Structure](#structure)
 - [Firmware Dashboard Sketch](#firmware-dashboard-sketch)
+- [Flashing from Release](#flashing-from-release)
 - [Wi-Fi Provisioning (ESPHome-Style)](#wi-fi-provisioning-esphome-style)
 - [Web UI and API](#web-ui-and-api)
 - [Historical Data Storage](#historical-data-storage)
@@ -18,8 +19,10 @@ This repo is intentionally cleaned down to the two active Arduino sketches:
 ## Structure
 
 - `arduino/JC4827W543_LVGLv9/` - main LVGL dashboard firmware
+- `arduino/JC4827W543_LVGLv9/data/` - portal HTML/JS (SPIFFS)
 - `arduino/I2C_Pin_Scanner_BME280/` - I2C/BME280 scanner firmware
 - `scripts/fw-arduino.sh` - build/upload script for dashboard sketch
+- `scripts/upload-portal-data.sh` - upload portal files to SPIFFS
 - `scripts/scan-i2c-pins.sh` - build/upload/monitor script for scanner sketch
 - `scripts/version.sh` - semantic version management helper
 
@@ -37,6 +40,24 @@ Uses ESP32S3 `huge_app` partition scheme via `scripts/fw-arduino.sh` so larger f
 # build + upload
 ./scripts/fw-arduino.sh upload --port /dev/cu.usbmodem101
 ```
+
+## Flashing from Release
+
+Pre-built firmware binaries are attached to [GitHub Releases](https://github.com/derrickbryant/esp32-lcd/releases). To flash without building from source:
+
+1. **Download the .bin file** from the latest release (e.g. `JC4827W543_LVGLv9-1.2.1.bin`).
+
+2. **Install esptool** (if needed):
+   ```bash
+   pip install esptool
+   ```
+
+3. **Flash the firmware** (replace `PORT` with your device, e.g. `/dev/cu.usbmodem101` on macOS):
+   ```bash
+   esptool.py --chip esp32s3 -p PORT write_flash 0x0 JC4827W543_LVGLv9-1.2.1.bin
+   ```
+
+4. **Reset the device** — it will boot into the new firmware.
 
 ## Wi-Fi Provisioning (ESPHome-Style)
 
@@ -63,16 +84,21 @@ Validation checklist:
 
 ## Web UI and API
 
-When connected (STA or AP mode), the web UI at `http://<device-ip>/` shows:
+The portal (HTML/JS) is served from SPIFFS. After flashing firmware, upload the portal data:
 
-- **Current settings**: Wi-Fi, timezone, brightness
-- **Live readings**: Temperature, humidity, pressure (refreshed every 5 seconds)
-- **7-day history**: Table of recent samples and a CSV download link
+```bash
+./scripts/upload-portal-data.sh --port /dev/cu.usbmodem101
+```
+
+When connected (STA or AP mode), the web UI at `http://<device-ip>/` has two pages:
+
+- **Status** (default): Live readings (refreshed every 5 seconds), 7-day history chart (temp, humidity, pressure), history table, and CSV download link
+- **Settings**: Wi-Fi provisioning, timezone, and brightness controls
 
 **API endpoints** (JSON):
 
 - `GET /api/readings` — Current sensor values (temp_c, temp_f, humidity_pct, pressure_hpa, timestamp, valid)
-- `GET /api/history` — 7-day history; use `?res=hourly` for 168 points
+- `GET /api/history` — 7-day history; `?res=5min` (2016 pts), `?res=15min` (672), `?res=30min` (336), `?res=hourly` (168)
 - `GET /api/status` — Settings plus current readings
 - `GET /history.csv` — Download full 7-day history as CSV
 
