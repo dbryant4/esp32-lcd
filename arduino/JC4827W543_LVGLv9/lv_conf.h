@@ -19,8 +19,6 @@
 #define LV_FONT_MONTSERRAT_14 1
 #define LV_FONT_MONTSERRAT_22 1
 #define LV_FONT_MONTSERRAT_36 1
-#define LV_FONT_MONTSERRAT_36_BOLD 1
-#define LV_FONT_CUSTOM_DECLARE LV_FONT_DECLARE(lv_font_montserrat_36_bold)
 #define LV_FONT_DEFAULT &lv_font_montserrat_14
 
 /* Keep logging off for lower overhead */

@@ -1396,7 +1396,7 @@ void setup()
   lv_obj_set_width(s_temp_value_label, col_w - 8);
   lv_label_set_long_mode(s_temp_value_label, LV_LABEL_LONG_CLIP);
   lv_obj_set_style_text_color(s_temp_value_label, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
-  lv_obj_set_style_text_font(s_temp_value_label, &lv_font_montserrat_36_bold, LV_PART_MAIN);
+  lv_obj_set_style_text_font(s_temp_value_label, &lv_font_montserrat_36, LV_PART_MAIN);
   s_temp_bar = lv_bar_create(scr);
   lv_obj_set_pos(s_temp_bar, pad, content_top + 68);
   lv_obj_set_size(s_temp_bar, col_w - 8, 8);
@@ -1419,7 +1419,7 @@ void setup()
   lv_obj_set_width(s_hum_value_label, col_w - 8);
   lv_label_set_long_mode(s_hum_value_label, LV_LABEL_LONG_CLIP);
   lv_obj_set_style_text_color(s_hum_value_label, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
-  lv_obj_set_style_text_font(s_hum_value_label, &lv_font_montserrat_36_bold, LV_PART_MAIN);
+  lv_obj_set_style_text_font(s_hum_value_label, &lv_font_montserrat_36, LV_PART_MAIN);
   s_hum_bar = lv_bar_create(scr);
   lv_obj_set_pos(s_hum_bar, pad + col_w + col_gap, content_top + 68);
   lv_obj_set_size(s_hum_bar, col_w - 8, 8);
@@ -1436,7 +1436,7 @@ void setup()
   lv_obj_set_width(s_press_value_label, col_w - 8);
   lv_label_set_long_mode(s_press_value_label, LV_LABEL_LONG_CLIP);
   lv_obj_set_style_text_color(s_press_value_label, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
-  lv_obj_set_style_text_font(s_press_value_label, &lv_font_montserrat_36_bold, LV_PART_MAIN);
+  lv_obj_set_style_text_font(s_press_value_label, &lv_font_montserrat_36, LV_PART_MAIN);
   s_press_bar = lv_bar_create(scr);
   lv_obj_set_pos(s_press_bar, pad + 2 * (col_w + col_gap), content_top + 68);
   lv_obj_set_size(s_press_bar, col_w - 8, 8);

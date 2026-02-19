@@ -45,7 +45,6 @@ install_deps() {
 
 compile_only() {
   rm -rf "$BUILD_DIR"
-  mkdir -p "$BUILD_DIR"
   arduino-cli compile --fqbn "$FQBN" --build-path "$BUILD_DIR" "$SKETCH_PATH"
 }
 
