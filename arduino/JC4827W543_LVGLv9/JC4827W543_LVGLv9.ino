@@ -26,8 +26,8 @@
 #define BACKLIGHT_PWM_BITS 8
 #define BACKLIGHT_DEFAULT_PERCENT 85
 #define FW_VERSION_MAJOR 1
-#define FW_VERSION_MINOR 1
-#define FW_VERSION_PATCH 1
+#define FW_VERSION_MINOR 2
+#define FW_VERSION_PATCH 0
 #define WIFI_AP_SSID_PREFIX "ESP32LCD-"
 #define WIFI_CONNECT_TIMEOUT_MS 45000UL
 #define WIFI_RECONNECT_INTERVAL_MS 10000UL
@@ -41,6 +41,34 @@
 #define DEBUG_PORTAL 1
 #define DISABLE_NTP 0
 #define DISABLE_WIFI 0
+
+#define HISTORY_SLOTS 2016
+#define HISTORY_INTERVAL_SEC 300
+#define HISTORY_PREFS_NAMESPACE "history"
+#define HISTORY_PERSIST_INTERVAL_MS 1800000UL
+
+struct HistorySlot
+{
+  uint32_t timestamp;
+  int16_t temp_c_x10;
+  uint8_t hum_pct;
+  uint16_t press_hpa;
+  uint8_t valid;
+} __attribute__((packed));
+
+static HistorySlot s_history[HISTORY_SLOTS];
+static uint16_t s_history_head = 0;
+static uint16_t s_history_count = 0;
+static uint32_t s_last_history_commit_epoch = 0;
+static uint32_t s_last_history_persist_ms = 0;
+static float s_agg_temp_sum = 0.0f;
+static float s_agg_hum_sum = 0.0f;
+static float s_agg_press_sum = 0.0f;
+static uint32_t s_agg_count = 0;
+static float s_last_temp_c = 0.0f;
+static float s_last_hum_pct = 0.0f;
+static float s_last_press_hpa = 0.0f;
+static bool s_last_reading_valid = false;
 
 static TAMC_GT911 touchController(TOUCH_SDA, TOUCH_SCL, TOUCH_INT, TOUCH_RST, TOUCH_WIDTH, TOUCH_HEIGHT);
 static Adafruit_BME280 bme;
@@ -77,6 +105,12 @@ static lv_obj_t *s_wifi_signal_bars[4] = {NULL, NULL, NULL, NULL};
 static lv_obj_t *s_wifi_signal_x_label = NULL;
 static lv_obj_t *s_wifi_signal_bars_cont = NULL;
 static lv_obj_t *s_wifi_signal_x_cont = NULL;
+static lv_obj_t *s_trend_chart = NULL;
+static lv_chart_series_t *s_trend_series_temp = NULL;
+static lv_chart_series_t *s_trend_series_hum = NULL;
+static uint32_t s_last_chart_update_ms = 0;
+#define CHART_UPDATE_INTERVAL_MS 60000UL
+#define TREND_POINTS 24
 static const char *TZ_OPTIONS[] = {
     "UTC",
     "Eastern (EST/EDT)",
@@ -416,10 +450,12 @@ static void start_sta_connect()
   push_event_log(msg);
 }
 
-#define PORTAL_HTML_BUF_SIZE 4200
+#define PORTAL_HTML_BUF_SIZE 9000
 #define PORTAL_SCAN_JSON_SIZE 1200
+#define API_JSON_BUF_SIZE 12000
 static char s_portal_html_buf[PORTAL_HTML_BUF_SIZE];
 static char s_portal_scan_json[PORTAL_SCAN_JSON_SIZE];
+static char s_api_json_buf[API_JSON_BUF_SIZE];
 
 static void build_settings_html()
 {
@@ -467,6 +503,17 @@ static void build_settings_html()
       "<button type='button' onclick='doSaveTz()'>Save timezone only</button> "
       "<button type='button' onclick='doSaveBrightness()'>Save brightness only</button>"
       "<p id='msg' style='margin-top:0.5rem'></p></form>"
+      "<hr style='border-color:#2a3240;margin:1rem 0'>"
+      "<h3>Live Readings</h3>"
+      "<p id='liveReadings'>Loading...</p>"
+      "<hr style='border-color:#2a3240;margin:1rem 0'>"
+      "<h3>7-Day History</h3>"
+      "<p><a href='/history.csv' download='history.csv' style='color:#60a5fa'>Download CSV</a></p>"
+      "<div id='historyTable' style='max-height:200px;overflow-y:auto;font-size:0.9rem'>"
+      "<table style='border-collapse:collapse;width:100%%'><thead><tr style='border-bottom:1px solid #2a3240'>"
+      "<th style='text-align:left;padding:4px'>Time</th><th style='text-align:right;padding:4px'>Temp C</th>"
+      "<th style='text-align:right;padding:4px'>Hum %%</th><th style='text-align:right;padding:4px'>hPa</th></tr></thead>"
+      "<tbody id='historyBody'></tbody></table></div>"
       "<script>"
       "document.getElementById('brightness').oninput=function(){document.getElementById('brightVal').textContent=this.value;};"
       "function getSsid(){var s=document.getElementById('ssid').value;if(s)return s;return document.getElementById('ssidManual').value.trim();}"
@@ -488,6 +535,21 @@ static void build_settings_html()
       "fetch('/save_tz',{method:'POST',body:fd}).then(r=>r.text()).then(t=>{document.getElementById('msg').textContent=t;});}"
       "function doSaveBrightness(){var fd=new FormData();fd.append('brightness',document.getElementById('brightness').value);"
       "fetch('/save_brightness',{method:'POST',body:fd}).then(r=>r.text()).then(t=>{document.getElementById('msg').textContent=t;});}"
+      "function loadLive(){fetch('/api/readings').then(r=>r.json()).then(d=>{"
+      "var el=document.getElementById('liveReadings');"
+      "el.innerHTML=d.valid?('Temp: '+d.temp_c+' C / '+d.temp_f+' F | Humidity: '+d.humidity_pct+'%% | Pressure: '+d.pressure_hpa+' hPa'):'No sensor data';"
+      "}).catch(()=>{document.getElementById('liveReadings').textContent='Failed to load';});}"
+      "function loadHistory(){fetch('/api/history?res=hourly').then(r=>r.json()).then(arr=>{"
+      "var tbody=document.getElementById('historyBody');tbody.innerHTML='';"
+      "var rows=Math.min(arr.length,24);"
+      "for(var i=Math.max(0,arr.length-24);i<arr.length;i++){var r=arr[i];if(!r.valid)continue;"
+      "var d=new Date(r.timestamp*1000);var s=d.toLocaleString();"
+      "var tr=document.createElement('tr');tr.style.borderBottom='1px solid #2a3240';"
+      "tr.innerHTML='<td style=padding:4px>'+s+'</td><td style=text-align:right;padding:4px>'+r.temp_c+'</td><td style=text-align:right;padding:4px>'+r.humidity_pct+'</td><td style=text-align:right;padding:4px>'+r.pressure_hpa+'</td>';"
+      "tbody.appendChild(tr);}"
+      "if(tbody.children.length===0)tbody.innerHTML='<tr><td colspan=4>No history yet</td></tr>';"
+      "}).catch(()=>{document.getElementById('historyBody').innerHTML='<tr><td colspan=4>Failed to load</td></tr>';});}"
+      "loadLive();loadHistory();setInterval(loadLive,5000);setInterval(loadHistory,60000);"
       "</script></body></html>",
       header_line,
       s_wifi_sta_ssid.c_str(),
@@ -684,6 +746,105 @@ static void setup_portal_routes()
                      }
                      else
                        s_wifi_server.send(400, "text/plain", "Invalid brightness (5-100)");
+                   });
+
+  s_wifi_server.on("/api/readings", HTTP_GET, []()
+                   {
+                     float tc = s_last_temp_c;
+                     float tf = (tc * 9.0f / 5.0f) + 32.0f;
+                     float hum = s_last_hum_pct;
+                     float ph = s_last_press_hpa;
+                     time_t now_t = time(nullptr);
+                     uint32_t ts = (now_t >= 86400 * 365) ? (uint32_t)now_t : 0;
+                     int n = snprintf(s_api_json_buf, sizeof(s_api_json_buf),
+                                      "{\"temp_c\":%.1f,\"temp_f\":%.1f,\"humidity_pct\":%.1f,\"pressure_hpa\":%.1f,\"timestamp\":%lu,\"valid\":%s}",
+                                      tc, tf, hum, ph, (unsigned long)ts, s_last_reading_valid ? "true" : "false");
+                     if (n > 0 && (size_t)n < sizeof(s_api_json_buf))
+                       s_wifi_server.send(200, "application/json", s_api_json_buf);
+                     else
+                       s_wifi_server.send(500, "application/json", "{\"error\":\"buffer\"}");
+                   });
+
+  s_wifi_server.on("/api/history", HTTP_GET, []()
+                   {
+                     bool hourly = (s_wifi_server.hasArg("res") && s_wifi_server.arg("res") == "hourly");
+                     size_t step = 1;
+                     size_t max_points = hourly ? 168 : HISTORY_SLOTS;
+                     size_t start_idx = 0;
+                     if (hourly && s_history_count > 24)
+                     {
+                       step = 12;
+                       size_t tail = s_history_count - 1;
+                       size_t need_slots = (max_points - 1) * step + 1;
+                       if (tail + 1 >= need_slots)
+                         start_idx = tail - (need_slots - 1);
+                     }
+                     size_t len = 0;
+                     len += snprintf(s_api_json_buf + len, sizeof(s_api_json_buf) - len, "[");
+                     size_t written = 0;
+                     for (size_t i = start_idx; i < s_history_count && written < max_points; i += step)
+                     {
+                       uint16_t phys = history_slot_index((uint16_t)i);
+                       HistorySlot *s = &s_history[phys];
+                       float tc = (float)s->temp_c_x10 / 10.0f;
+                       if (len < sizeof(s_api_json_buf) - 80)
+                         len += snprintf(s_api_json_buf + len, sizeof(s_api_json_buf) - len,
+                                         "%s{\"timestamp\":%lu,\"temp_c\":%.1f,\"humidity_pct\":%u,\"pressure_hpa\":%u,\"valid\":%s}",
+                                         (written > 0) ? "," : "", (unsigned long)s->timestamp, tc, (unsigned)s->hum_pct, (unsigned)s->press_hpa, s->valid ? "true" : "false");
+                       written++;
+                     }
+                     len += snprintf(s_api_json_buf + len, sizeof(s_api_json_buf) - len, "]");
+                     if (len < sizeof(s_api_json_buf))
+                       s_wifi_server.send(200, "application/json", s_api_json_buf);
+                     else
+                       s_wifi_server.send(500, "application/json", "{\"error\":\"buffer\"}");
+                   });
+
+  s_wifi_server.on("/api/status", HTTP_GET, []()
+                   {
+                     float tc = s_last_temp_c;
+                     float tf = (tc * 9.0f / 5.0f) + 32.0f;
+                     time_t now_t = time(nullptr);
+                     uint32_t ts = (now_t >= 86400 * 365) ? (uint32_t)now_t : 0;
+                     const char *wifi_ssid = (s_wifi_state == WIFI_STATE_STA_CONNECTED && WiFi.status() == WL_CONNECTED) ? WiFi.SSID().c_str() : "";
+                     int n = snprintf(s_api_json_buf, sizeof(s_api_json_buf),
+                                      "{\"brightness\":%d,\"timezone_index\":%u,\"wifi_ssid\":\"%s\",\"wifi_connected\":%s,"
+                                      "\"temp_c\":%.1f,\"temp_f\":%.1f,\"humidity_pct\":%.1f,\"pressure_hpa\":%.1f,\"timestamp\":%lu,\"valid\":%s}",
+                                      s_brightness_percent, (unsigned)s_timezone_index, wifi_ssid,
+                                      (s_wifi_state == WIFI_STATE_STA_CONNECTED && WiFi.status() == WL_CONNECTED) ? "true" : "false",
+                                      tc, tf, s_last_hum_pct, s_last_press_hpa, (unsigned long)ts, s_last_reading_valid ? "true" : "false");
+                     if (n > 0 && (size_t)n < sizeof(s_api_json_buf))
+                       s_wifi_server.send(200, "application/json", s_api_json_buf);
+                     else
+                       s_wifi_server.send(500, "application/json", "{\"error\":\"buffer\"}");
+                   });
+
+  s_wifi_server.on("/history.csv", HTTP_GET, []()
+                   {
+                     s_wifi_server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+                     s_wifi_server.sendHeader("Content-Disposition", "attachment; filename=\"history.csv\"");
+                     s_wifi_server.send(200, "text/csv", "");
+                     char row[128];
+                     snprintf(row, sizeof(row), "timestamp_utc,datetime_local,temp_c,temp_f,humidity_pct,pressure_hpa\n");
+                     s_wifi_server.sendContent(row);
+                     for (size_t i = 0; i < s_history_count; i++)
+                     {
+                       uint16_t phys = history_slot_index((uint16_t)i);
+                       HistorySlot *s = &s_history[phys];
+                       if (!s->valid)
+                         continue;
+                       float tc = (float)s->temp_c_x10 / 10.0f;
+                       float tf = (tc * 9.0f / 5.0f) + 32.0f;
+                       struct tm tmbuf;
+                       struct tm *tm = gmtime_r((time_t *)&s->timestamp, &tmbuf);
+                       char dt[32] = "";
+                       if (tm)
+                         strftime(dt, sizeof(dt), "%Y-%m-%dT%H:%M:%SZ", tm);
+                       snprintf(row, sizeof(row), "%lu,%s,%.1f,%.1f,%u,%u\n",
+                                (unsigned long)s->timestamp, dt, tc, tf, (unsigned)s->hum_pct, (unsigned)s->press_hpa);
+                       s_wifi_server.sendContent(row);
+                     }
+                     s_wifi_server.sendContent("");
                    });
 
   s_wifi_server.on("/generate_204", HTTP_GET, []()
@@ -1155,6 +1316,154 @@ static float hpa_to_inhg(float hpa)
   return hpa * 0.0295299831f;
 }
 
+static void history_push_slot(uint32_t ts, float temp_c, float hum_pct, float press_hpa, bool valid)
+{
+  HistorySlot *slot = &s_history[s_history_head];
+  slot->timestamp = ts;
+  slot->temp_c_x10 = (int16_t)(temp_c * 10.0f);
+  slot->hum_pct = (uint8_t)(hum_pct + 0.5f);
+  slot->press_hpa = (uint16_t)(press_hpa + 0.5f);
+  slot->valid = valid ? 1 : 0;
+  s_history_head = (s_history_head + 1) % HISTORY_SLOTS;
+  if (s_history_count < HISTORY_SLOTS)
+    s_history_count++;
+  s_last_history_commit_epoch = ts;
+}
+
+static uint16_t history_slot_index(uint16_t logical_idx)
+{
+  if (s_history_count < HISTORY_SLOTS)
+    return logical_idx;
+  return (s_history_head + logical_idx) % HISTORY_SLOTS;
+}
+
+static void history_maybe_persist()
+{
+  uint32_t now = millis();
+  if (s_history_count > 0 && (uint32_t)(now - s_last_history_persist_ms) >= HISTORY_PERSIST_INTERVAL_MS)
+    history_persist();
+}
+
+static void update_trend_chart()
+{
+  if (!s_trend_chart || !s_trend_series_temp || !s_trend_series_hum)
+    return;
+  int hourly_step = 12;
+  int max_hourly = TREND_POINTS;
+  if ((int)s_history_count < max_hourly * hourly_step)
+    hourly_step = 1;
+  for (int i = 0; i < TREND_POINTS; i++)
+  {
+    int logical_idx = (int)s_history_count - 1 - (TREND_POINTS - 1 - i) * hourly_step;
+    int32_t temp_val = LV_CHART_POINT_NONE;
+    int32_t hum_val = LV_CHART_POINT_NONE;
+    if (logical_idx >= 0 && (size_t)logical_idx < s_history_count)
+    {
+      uint16_t phys = history_slot_index((uint16_t)logical_idx);
+      HistorySlot *s = &s_history[phys];
+      if (s->valid)
+      {
+        temp_val = (int32_t)((float)s->temp_c_x10 / 10.0f + 0.5f);
+        hum_val = (int32_t)s->hum_pct;
+      }
+    }
+    lv_chart_set_series_value_by_id(s_trend_chart, s_trend_series_temp, (uint32_t)i, temp_val);
+    lv_chart_set_series_value_by_id(s_trend_chart, s_trend_series_hum, (uint32_t)i, hum_val);
+  }
+  lv_chart_refresh(s_trend_chart);
+}
+
+static void history_insert_gaps(uint32_t from_epoch, uint32_t to_epoch)
+{
+  uint32_t t = from_epoch;
+  while (t + HISTORY_INTERVAL_SEC <= to_epoch)
+  {
+    t += HISTORY_INTERVAL_SEC;
+    history_push_slot(t, 0.0f, 0.0f, 0.0f, false);
+  }
+}
+
+static void history_commit(float temp_c, float hum_pct, float press_hpa)
+{
+  time_t now = time(nullptr);
+  if (now < 86400 * 365)
+    return;
+  uint32_t epoch = (uint32_t)now;
+  uint32_t slot_epoch = (epoch / HISTORY_INTERVAL_SEC) * HISTORY_INTERVAL_SEC;
+  if (s_last_history_commit_epoch > 0 && slot_epoch > s_last_history_commit_epoch + HISTORY_INTERVAL_SEC)
+  {
+    uint32_t gap_count = (slot_epoch - s_last_history_commit_epoch) / HISTORY_INTERVAL_SEC - 1;
+    if (gap_count > 0 && gap_count <= HISTORY_SLOTS)
+      history_insert_gaps(s_last_history_commit_epoch, slot_epoch);
+  }
+  history_push_slot(slot_epoch, temp_c, hum_pct, press_hpa, true);
+}
+
+static void history_persist()
+{
+  Preferences p;
+  if (!p.begin(HISTORY_PREFS_NAMESPACE, false))
+    return;
+  p.putUShort("head", s_history_head);
+  p.putUShort("count", s_history_count);
+  p.putULong("last_epoch", (unsigned long)s_last_history_commit_epoch);
+  const size_t chunk_size = 500;
+  const size_t slot_size = sizeof(HistorySlot);
+  size_t total_bytes = s_history_count * slot_size;
+  for (size_t offset = 0; offset < total_bytes; offset += chunk_size)
+  {
+    char key[16];
+    snprintf(key, sizeof(key), "d%zu", offset / chunk_size);
+    size_t len = (offset + chunk_size <= total_bytes) ? chunk_size : (total_bytes - offset);
+    uint8_t buf[chunk_size];
+    for (size_t i = 0; i < len; i++)
+    {
+      size_t slot_idx = (offset + i) / slot_size;
+      size_t byte_in_slot = (offset + i) % slot_size;
+      uint16_t phys = history_slot_index((uint16_t)slot_idx);
+      buf[i] = ((uint8_t *)&s_history[phys])[byte_in_slot];
+    }
+    p.putBytes(key, buf, len);
+  }
+  p.end();
+  s_last_history_persist_ms = millis();
+}
+
+static void history_restore()
+{
+  Preferences p;
+  if (!p.begin(HISTORY_PREFS_NAMESPACE, true))
+    return;
+  s_history_head = p.getUShort("head", 0);
+  s_history_count = p.getUShort("count", 0);
+  s_last_history_commit_epoch = p.getULong("last_epoch", 0);
+  if (s_history_count == 0 || s_history_count > HISTORY_SLOTS)
+  {
+    p.end();
+    return;
+  }
+  const size_t chunk_size = 500;
+  const size_t slot_size = sizeof(HistorySlot);
+  size_t total_bytes = s_history_count * slot_size;
+  for (size_t offset = 0; offset < total_bytes; offset += chunk_size)
+  {
+    char key[16];
+    snprintf(key, sizeof(key), "d%zu", offset / chunk_size);
+    size_t len = (offset + chunk_size <= total_bytes) ? chunk_size : (total_bytes - offset);
+    uint8_t buf[chunk_size];
+    if (p.getBytes(key, buf, len) != len)
+      break;
+    for (size_t i = 0; i < len; i++)
+    {
+      size_t slot_idx = (offset + i) / slot_size;
+      size_t byte_in_slot = (offset + i) % slot_size;
+      uint16_t phys = history_slot_index((uint16_t)slot_idx);
+      ((uint8_t *)&s_history[phys])[byte_in_slot] = buf[i];
+    }
+  }
+  p.end();
+}
+
 static const char *trim_leading_spaces(char *s)
 {
   while (*s == ' ')
@@ -1195,6 +1504,7 @@ static void sensor_timer_cb(lv_timer_t *timer)
   LV_UNUSED(timer);
   if (!bme_ready)
   {
+    s_last_reading_valid = false;
     push_event_log_throttled("BME: sensor not ready", 5000, &s_last_bme_not_ready_log_ms);
     if (s_status_label)
     {
@@ -1212,6 +1522,7 @@ static void sensor_timer_cb(lv_timer_t *timer)
   float press_hpa = bme.readPressure() / 100.0f;
   if (isnan(temp_c) || isnan(hum_pct) || isnan(press_hpa))
   {
+    s_last_reading_valid = false;
     push_event_log_throttled("BME: invalid reading", 5000, &s_last_bme_invalid_log_ms);
     return;
   }
@@ -1219,6 +1530,32 @@ static void sensor_timer_cb(lv_timer_t *timer)
   {
     push_event_log("BME: first reading OK");
     s_logged_first_sensor_ok = true;
+  }
+  s_last_temp_c = temp_c;
+  s_last_hum_pct = hum_pct;
+  s_last_press_hpa = press_hpa;
+  s_last_reading_valid = true;
+  s_agg_temp_sum += temp_c;
+  s_agg_hum_sum += hum_pct;
+  s_agg_press_sum += press_hpa;
+  s_agg_count++;
+  time_t now_t = time(nullptr);
+  if (now_t >= 86400 * 365)
+  {
+    uint32_t epoch = (uint32_t)now_t;
+    uint32_t slot_epoch = (epoch / HISTORY_INTERVAL_SEC) * HISTORY_INTERVAL_SEC;
+    if (slot_epoch > s_last_history_commit_epoch)
+    {
+      float avg_t = (s_agg_count > 0) ? (s_agg_temp_sum / (float)s_agg_count) : temp_c;
+      float avg_h = (s_agg_count > 0) ? (s_agg_hum_sum / (float)s_agg_count) : hum_pct;
+      float avg_p = (s_agg_count > 0) ? (s_agg_press_sum / (float)s_agg_count) : press_hpa;
+      history_commit(avg_t, avg_h, avg_p);
+      s_agg_temp_sum = 0.0f;
+      s_agg_hum_sum = 0.0f;
+      s_agg_press_sum = 0.0f;
+      s_agg_count = 0;
+      history_maybe_persist();
+    }
   }
   update_sensor_ui(temp_c, hum_pct, press_hpa);
   if (s_status_label)
@@ -1251,6 +1588,7 @@ void setup()
 #endif
   uiPrefs.begin(UI_PREFS_NAMESPACE, false);
   load_timezone();
+  history_restore();
 
   if (!gfx->begin())
   {
@@ -1443,6 +1781,33 @@ void setup()
   lv_bar_set_range(s_press_bar, 900, 1100);
   style_metric_bar(s_press_bar, LV_PALETTE_GREEN);
 
+  const int chart_top = 156;
+  const int chart_h = 98;
+  s_trend_chart = lv_chart_create(scr);
+  lv_obj_set_pos(s_trend_chart, pad, chart_top);
+  lv_obj_set_size(s_trend_chart, screenWidth - 2 * pad, chart_h);
+  lv_obj_set_style_bg_color(s_trend_chart, lv_color_hex(0x141E32), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(s_trend_chart, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_border_color(s_trend_chart, lv_color_hex(0x2A3240), LV_PART_MAIN);
+  lv_obj_set_style_border_width(s_trend_chart, 1, LV_PART_MAIN);
+  lv_obj_set_style_radius(s_trend_chart, 6, LV_PART_MAIN);
+  lv_obj_set_style_pad_all(s_trend_chart, 4, LV_PART_MAIN);
+  lv_chart_set_type(s_trend_chart, LV_CHART_TYPE_LINE);
+  lv_chart_set_point_count(s_trend_chart, TREND_POINTS);
+  lv_chart_set_div_line_count(s_trend_chart, 2, 0);
+  lv_chart_set_axis_range(s_trend_chart, LV_CHART_AXIS_PRIMARY_Y, -10, 50);
+  lv_chart_set_axis_range(s_trend_chart, LV_CHART_AXIS_SECONDARY_Y, 0, 100);
+  s_trend_series_temp = lv_chart_add_series(s_trend_chart, lv_palette_main(LV_PALETTE_RED), LV_CHART_AXIS_PRIMARY_Y);
+  s_trend_series_hum = lv_chart_add_series(s_trend_chart, lv_palette_main(LV_PALETTE_BLUE), LV_CHART_AXIS_SECONDARY_Y);
+  lv_obj_t *chart_timescale = lv_label_create(scr);
+  lv_label_set_text(chart_timescale, "last 24 hours");
+  lv_obj_set_style_text_color(chart_timescale, lv_color_hex(0x8BA3C7), LV_PART_MAIN);
+  lv_obj_set_style_text_font(chart_timescale, &lv_font_montserrat_14, LV_PART_MAIN);
+  lv_obj_set_width(chart_timescale, screenWidth - 2 * pad);
+  lv_obj_set_style_text_align(chart_timescale, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+  lv_obj_set_pos(chart_timescale, pad, chart_top + chart_h + 2);
+  update_trend_chart();
+
   update_sensor_ui(0.0f, 0.0f, 900.0f);
   sensor_timer_cb(NULL);
   lv_timer_create(sensor_timer_cb, 1000, NULL);
@@ -1600,6 +1965,15 @@ void loop()
   s_loop_count++;
   lv_timer_handler();
   wifi_runtime_tick();
+  history_maybe_persist();
+  {
+    uint32_t now_ms = millis();
+    if (s_trend_chart && (uint32_t)(now_ms - s_last_chart_update_ms) >= CHART_UPDATE_INTERVAL_MS)
+    {
+      s_last_chart_update_ms = now_ms;
+      update_trend_chart();
+    }
+  }
   gfx->flush();
   delay(5);
 }

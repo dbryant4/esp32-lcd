@@ -24,5 +24,8 @@
 /* Keep logging off for lower overhead */
 #define LV_USE_LOG 0
 
+/* Chart widget for 24-hour trend display */
+#define LV_USE_CHART 1
+
 #endif /*LV_CONF_H*/
 
