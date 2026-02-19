@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 SKETCH_PATH="$PROJECT_ROOT/arduino/JC4827W543_LVGLv9/JC4827W543_LVGLv9.ino"
 BUILD_DIR="$PROJECT_ROOT/build-arduino"
-FQBN="esp32:esp32:esp32s3"
+FQBN="esp32:esp32:esp32s3:PartitionScheme=huge_app"
 PORT="/dev/cu.usbmodem101"
 
 if [[ ! -f "$SKETCH_PATH" ]]; then

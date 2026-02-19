@@ -1,0 +1,18 @@
+---
+description: Enforce firmware semantic version bump workflow
+alwaysApply: true
+---
+
+# Semantic Versioning Workflow
+
+- Firmware version source of truth is in `arduino/JC4827W543_LVGLv9/JC4827W543_LVGLv9.ino` using:
+  - `FW_VERSION_MAJOR`
+  - `FW_VERSION_MINOR`
+  - `FW_VERSION_PATCH`
+- On the first implementation request in each new AI chat/session, increment the **minor** version and reset patch to `0`.
+- Keep major unchanged unless the user explicitly requests a breaking-change bump.
+- Update any user-visible version text in the firmware debug UI when version changes.
+
+Example:
+- Previous: `1.1.0`
+- New chat start: `1.2.0`
