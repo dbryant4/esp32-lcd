@@ -17,7 +17,13 @@
 <h3>Live Readings</h3>
 <p id="liveReadings">Loading...</p>
 <h3>7-Day History</h3>
-<p style="margin-bottom:0.5rem">Resolution: <select id="historyRes" style="padding:4px 8px;background:#1e293b;color:#e6eaf2;border:1px solid #2a3240;border-radius:4px">
+<p style="margin-bottom:0.5rem">Units: <select id="tempUnit" style="padding:4px 8px;background:#1e293b;color:#e6eaf2;border:1px solid #2a3240;border-radius:4px">
+<option value="C">Temp °C</option>
+<option value="F">Temp °F</option>
+</select> <select id="pressureUnit" style="padding:4px 8px;background:#1e293b;color:#e6eaf2;border:1px solid #2a3240;border-radius:4px">
+<option value="hPa">Pressure hPa</option>
+<option value="inHg">Pressure inHg</option>
+</select> Resolution: <select id="historyRes" style="padding:4px 8px;background:#1e293b;color:#e6eaf2;border:1px solid #2a3240;border-radius:4px">
 <option value="5min">Every 5 min (~2016 pts)</option>
 <option value="15min">Every 15 min (~672 pts)</option>
 <option value="30min">Every 30 min (~336 pts)</option>
@@ -27,8 +33,8 @@
 <p><a href="/history.csv" download="history.csv" style="color:#60a5fa">Download CSV</a></p>
 <div id="historyTable" style="max-height:200px;overflow-y:auto;font-size:0.9rem">
 <table style="border-collapse:collapse;width:100%"><thead><tr style="border-bottom:1px solid #2a3240">
-<th style="text-align:left;padding:4px">Time</th><th style="text-align:right;padding:4px">Temp C</th>
-<th style="text-align:right;padding:4px">Hum %</th><th style="text-align:right;padding:4px">hPa</th></tr></thead>
+<th style="text-align:left;padding:4px">Time</th><th style="text-align:right;padding:4px" id="thTemp">Temp °C</th>
+<th style="text-align:right;padding:4px">Hum %</th><th style="text-align:right;padding:4px" id="thPressure">hPa</th></tr></thead>
 <tbody id="historyBody"></tbody></table></div>
 </div>
 <div id="settingsPage" style="display:none">

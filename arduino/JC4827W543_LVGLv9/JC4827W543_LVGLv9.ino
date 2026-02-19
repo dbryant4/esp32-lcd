@@ -458,11 +458,10 @@ static void start_sta_connect()
 
 #define PORTAL_SCAN_JSON_SIZE 1200
 #define API_JSON_BUF_SIZE 12000
-#define API_HISTORY_JSON_BUF_SIZE 135000
+#define API_HISTORY_MAX_POINTS 149
 static char s_portal_scan_json[PORTAL_SCAN_JSON_SIZE];
 static bool s_spiffs_ok = false;
 static char s_api_json_buf[API_JSON_BUF_SIZE];
-static char s_api_history_json_buf[API_HISTORY_JSON_BUF_SIZE];
 
 #define API_ESC_BUF_SIZE 128
 static char s_device_label_buf[API_ESC_BUF_SIZE];
@@ -748,7 +747,7 @@ static void setup_portal_routes()
   s_wifi_server.on("/api/history", HTTP_GET, []()
                    {
                      size_t step = 1;
-                     size_t max_points = HISTORY_SLOTS;
+                     size_t max_points = API_HISTORY_MAX_POINTS;
                      if (s_wifi_server.hasArg("res"))
                      {
                        String r = s_wifi_server.arg("res");
@@ -757,6 +756,10 @@ static void setup_portal_routes()
                        else if (r == "15min") { step = 3; max_points = 672; }
                        else if (r == "5min") { step = 1; max_points = HISTORY_SLOTS; }
                      }
+                     if (max_points > API_HISTORY_MAX_POINTS)
+                       max_points = API_HISTORY_MAX_POINTS;
+                     if (step == 1 && s_history_count > max_points)
+                       step = (s_history_count + max_points - 1) / max_points;
                      size_t start_idx = 0;
                      if (step > 1 && s_history_count > 24)
                      {
@@ -765,25 +768,23 @@ static void setup_portal_routes()
                        if (tail + 1 >= need_slots)
                          start_idx = tail - (need_slots - 1);
                      }
-                     char *buf = (max_points > 500) ? s_api_history_json_buf : s_api_json_buf;
-                     size_t buf_size = (max_points > 500) ? sizeof(s_api_history_json_buf) : sizeof(s_api_json_buf);
                      size_t len = 0;
-                     len += snprintf(buf + len, buf_size - len, "[");
+                     len += snprintf(s_api_json_buf + len, sizeof(s_api_json_buf) - len, "[");
                      size_t written = 0;
                      for (size_t i = start_idx; i < s_history_count && written < max_points; i += step)
                      {
                        uint16_t phys = history_slot_index((uint16_t)i);
                        HistorySlot *s = &s_history[phys];
                        float tc = (float)s->temp_c_x10 / 10.0f;
-                       if (len < buf_size - 80)
-                         len += snprintf(buf + len, buf_size - len,
+                       if (len < sizeof(s_api_json_buf) - 80)
+                         len += snprintf(s_api_json_buf + len, sizeof(s_api_json_buf) - len,
                                          "%s{\"timestamp\":%lu,\"temp_c\":%.1f,\"humidity_pct\":%u,\"pressure_hpa\":%u,\"valid\":%s}",
                                          (written > 0) ? "," : "", (unsigned long)s->timestamp, tc, (unsigned)s->hum_pct, (unsigned)s->press_hpa, s->valid ? "true" : "false");
                        written++;
                      }
-                     len += snprintf(buf + len, buf_size - len, "]");
-                     if (len < buf_size)
-                       s_wifi_server.send(200, "application/json", buf);
+                     len += snprintf(s_api_json_buf + len, sizeof(s_api_json_buf) - len, "]");
+                     if (len < sizeof(s_api_json_buf))
+                       s_wifi_server.send(200, "application/json", s_api_json_buf);
                      else
                      {
                        push_event_log("Portal: api/history buf err");
